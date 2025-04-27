@@ -7,14 +7,14 @@ Original file is located at
     https://colab.research.google.com/drive/16Fz3B734zRu80TBlhha-nu5UMKuou6YJ
 
 Impartire date
+
+# **Preprocessing**
 """
 
 from google.colab import drive
 import pandas as pd
 from sklearn.model_selection import train_test_split
 drive.mount('/content/drive')
-
-"""# **Preprocessing**"""
 
 import pandas as pd
 import numpy as np
@@ -1101,6 +1101,264 @@ for index, sentence in enumerate(confusion_sentences):
     actual_label = y_test[confusion_indices].iloc[index]
     predicted_label = y_pred[confusion_indices][index]
     print(f"Propoziție: {sentence}\nEtichetă reală: {actual_label}, Etichetă prezisă: {predicted_label}\n")
+
+"""# Roberta + LORA"""
+
+!pip install peft
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from torch.utils.data import DataLoader, Dataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix, ConfusionMatrixDisplay
+import numpy as np
+from tqdm import tqdm
+import pandas as pd
+import matplotlib.pyplot as plt
+from peft import LoraConfig, get_peft_model
+
+class TextDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_length=512):
+        self.texts = texts.tolist() if isinstance(texts, pd.Series) else texts
+        self.labels = labels.tolist() if isinstance(labels, pd.Series) else labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        label = self.labels[idx]
+
+        encoding = self.tokenizer(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
+
+def evaluate_model(model, data_loader, device):
+    model.eval()
+    predictions = []
+    true_labels = []
+    total_loss = 0
+
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            total_loss += loss.item()
+
+            preds = torch.argmax(outputs.logits, dim=1).cpu().numpy()
+            predictions.extend(preds)
+            true_labels.extend(labels.cpu().numpy())
+
+    accuracy = accuracy_score(true_labels, predictions)
+    avg_loss = total_loss / len(data_loader)
+
+    return accuracy, avg_loss, predictions, true_labels
+
+def plot_confusion_matrix(y_true, y_pred, title='Confusion Matrix'):
+    plt.figure(figsize=(10, 8))
+    cm = confusion_matrix(y_true, y_pred)
+
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Class 0', 'Class 1'])
+    disp.plot(cmap='Blues')
+
+    plt.title(title)
+    plt.show()
+
+    print(f"\n{title}:")
+    print("-" * len(title))
+    print(f"True Negatives: {cm[0][0]}")
+    print(f"False Positives: {cm[0][1]}")
+    print(f"False Negatives: {cm[1][0]}")
+    print(f"True Positives: {cm[1][1]}")
+
+    if (cm[1][1] + cm[0][1]) > 0:
+        precision = cm[1][1] / (cm[1][1] + cm[0][1])
+    else:
+        precision = 0.0
+
+    if (cm[1][1] + cm[1][0]) > 0:
+        recall = cm[1][1] / (cm[1][1] + cm[1][0])
+    else:
+        recall = 0.0
+
+    if (precision + recall) > 0:
+        f1 = 2 * (precision * recall) / (precision + recall)
+    else:
+        f1 = 0.0
+
+    print("\nMetrics:")
+    print("---------")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+
+def train_model_lora(model, train_loader, val_loader, device, epochs=3, patience=2):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4) # Lower learning rate for LORA
+    best_val_accuracy = 0
+    best_model_state = None
+    patience_counter = 0
+
+    train_losses = []
+    val_losses = []
+    train_accuracies = []
+    val_accuracies = []
+
+    for epoch in range(epochs):
+        # Training phase
+        model.train()
+        train_loss = 0
+        train_predictions = []
+        train_true_labels = []
+
+        for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs} - Training'):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+            preds = torch.argmax(outputs.logits, dim=1).cpu().numpy()
+            train_predictions.extend(preds)
+            train_true_labels.extend(labels.cpu().numpy())
+
+        # Calculate training metrics
+        train_accuracy = accuracy_score(train_true_labels, train_predictions)
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        train_accuracies.append(train_accuracy)
+
+        # Validation phase
+        val_accuracy, val_loss, val_predictions, val_true = evaluate_model(model, val_loader, device)
+        val_losses.append(val_loss)
+        val_accuracies.append(val_accuracy)
+
+        print(f'Epoch {epoch + 1}:')
+        print(f'Train Loss: {avg_train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}')
+        print(f'Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}')
+
+        # Early stopping with patience
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'\nEarly stopping triggered after epoch {epoch + 1}')
+                break
+
+    # Load best model state
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    # Plot training history
+    plt.figure(figsize=(12, 4))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accuracies, label='Training Accuracy')
+    plt.plot(val_accuracies, label='Validation Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    return best_val_accuracy
+
+def main_lora(X_train, y_train, X_val, y_val, X_test, y_test):
+    # Load RoBERT model and tokenizer
+    model_name = "xlm-roberta-base"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    base_model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+
+    # Configure LORA
+    lora_config = LoraConfig(
+        r=32,
+        lora_alpha=128,
+        lora_dropout=0.3,
+        bias="none",
+        task_type="SEQ_CLS" # Sequence classification
+    )
+
+    # Get the LORA model
+    model = get_peft_model(base_model, lora_config)
+    model.print_trainable_parameters()
+
+    # Create datasets
+    train_dataset = TextDataset(X_train, y_train, tokenizer)
+    val_dataset = TextDataset(X_val, y_val, tokenizer)
+    test_dataset = TextDataset(X_test, y_test, tokenizer)
+
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32)
+    test_loader = DataLoader(test_dataset, batch_size=32)
+
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    # Train the LORA adapted model
+    best_val_accuracy = train_model_lora(model, train_loader, val_loader, device, epochs=10, patience=2)
+    print(f'\nBest validation accuracy (LORA): {best_val_accuracy:.4f}')
+
+    # Evaluate on test set
+    test_accuracy, test_loss, test_predictions, test_true = evaluate_model(model, test_loader, device)
+    print(f'\nFinal test accuracy (LORA): {test_accuracy:.4f}')
+    print(f'Final test loss (LORA): {test_loss:.4f}')
+
+    # Plot final test confusion matrix
+    plot_confusion_matrix(test_true, test_predictions, title='Test Set Confusion Matrix (LORA)')
+
+    return model, tokenizer
+
+# Assuming train_df, validation_df, and test_df are already loaded
+X_train=train_df['Text']
+y_train=train_df['Label']
+X_validation=validation_df['Text']
+y_validation=validation_df['Label']
+X_test=test_df['Text']
+y_test=test_df['Label']
+
+# Run the training with LORA
+lora_model, lora_tokenizer = main_lora(X_train, y_train, X_validation, y_validation, X_test, y_test)
+
+# Salvare model LORA + tokenizer
+lora_model.save_pretrained("RoBERT_model_humor_classification_lora")
+lora_tokenizer.save_pretrained("RoBERT_model_humor_classification_lora_tokenizer")
 
 """# **GPT-2 romana**"""
 
